@@ -1,9 +1,10 @@
-const fs = require('fs')
-const { SourceMapConsumer } = require('source-map')
-const path = require('path')
-const pify = require('pify')
+const fs = require('fs');
+const path = require('path');
+const { SourceMapConsumer } = require('source-map');
+const pify = require('pify');
+const { codeFrameColumns } = require('@babel/code-frame');
 
-const fsAsync = pify(fs)
+const fsAsync = pify(fs);
 
 //
 // Utility to help check if sourcemaps are working
@@ -13,94 +14,147 @@ const fsAsync = pify(fs)
 // if not working it may error or print minified garbage
 //
 
-start().catch(console.error)
+start().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
 
+async function start() {
+  const targetFiles = [
+    `common-0.js`,
+    `background-0.js`,
+    `ui-0.js`,
+    'phishing-detect-0.js',
+    // `contentscript.js`, skipped because the validator is erroneously sampling the inlined `inpage.js` script
+    `inpage.js`,
+  ];
+  let valid = true;
 
-async function start () {
-  const targetFiles = [`inpage.js`, `contentscript.js`, `ui.js`, `background.js`]
   for (const buildName of targetFiles) {
-    await validateSourcemapForFile({ buildName })
+    const fileIsValid = await validateSourcemapForFile({ buildName });
+    valid = valid && fileIsValid;
+  }
+
+  if (!valid) {
+    process.exit(1);
   }
 }
 
-async function validateSourcemapForFile ({ buildName }) {
-  console.log(`build "${buildName}"`)
-  const platform = `chrome`
+async function validateSourcemapForFile({ buildName }) {
+  console.log(`build "${buildName}"`);
+  const platform = `chrome`;
   // load build and sourcemaps
-  let rawBuild
+  let rawBuild;
   try {
-    const filePath = path.join(__dirname, `/../dist/${platform}/`, `${buildName}`)
-    rawBuild = await fsAsync.readFile(filePath, 'utf8')
-  } catch (err) {}
+    const filePath = path.join(
+      __dirname,
+      `/../dist/${platform}/`,
+      `${buildName}`,
+    );
+    rawBuild = await fsAsync.readFile(filePath, 'utf8');
+  } catch (_) {
+    // empty
+  }
   if (!rawBuild) {
-    throw new Error(`SourcemapValidator - failed to load source file for "${buildName}"`)
+    throw new Error(
+      `SourcemapValidator - failed to load source file for "${buildName}"`,
+    );
   }
   // attempt to load in dist mode
-  let rawSourceMap
+  let rawSourceMap;
   try {
-    const filePath = path.join(__dirname, `/../dist/sourcemaps/`, `${buildName}.map`)
-    rawSourceMap = await fsAsync.readFile(filePath, 'utf8')
-  } catch (err) {}
+    const filePath = path.join(
+      __dirname,
+      `/../dist/sourcemaps/`,
+      `${buildName}.map`,
+    );
+    rawSourceMap = await fsAsync.readFile(filePath, 'utf8');
+  } catch (_) {
+    // empty
+  }
   // attempt to load in dev mode
   try {
-    const filePath = path.join(__dirname, `/../dist/${platform}/`, `${buildName}.map`)
-    rawSourceMap = await fsAsync.readFile(filePath, 'utf8')
-  } catch (err) {}
+    const filePath = path.join(
+      __dirname,
+      `/../dist/${platform}/`,
+      `${buildName}.map`,
+    );
+    rawSourceMap = await fsAsync.readFile(filePath, 'utf8');
+  } catch (_) {
+    // empty
+  }
   if (!rawSourceMap) {
-    throw new Error(`SourcemapValidator - failed to load sourcemaps for "${buildName}"`)
+    throw new Error(
+      `SourcemapValidator - failed to load sourcemaps for "${buildName}"`,
+    );
   }
 
-  const consumer = await new SourceMapConsumer(rawSourceMap)
+  const consumer = await new SourceMapConsumer(rawSourceMap);
 
-  const hasContentsOfAllSources = consumer.hasContentsOfAllSources()
+  const hasContentsOfAllSources = consumer.hasContentsOfAllSources();
   if (!hasContentsOfAllSources) {
-    console.warn('SourcemapValidator - missing content of some sources...')
+    console.warn('SourcemapValidator - missing content of some sources...');
   }
 
-  console.log(`  sampling from ${consumer.sources.length} files`)
-  let sampleCount = 0
+  console.log(`  sampling from ${consumer.sources.length} files`);
+  let sampleCount = 0;
+  let valid = true;
 
-  const buildLines = rawBuild.split('\n')
-  const targetString = 'new Error'
-  // const targetString = 'null'
-  const matchesPerLine = buildLines.map((line) => indicesOf(targetString, line))
+  const buildLines = rawBuild.split('\n');
+  const targetString = 'new Error';
+  const matchesPerLine = buildLines.map((line) =>
+    indicesOf(targetString, line),
+  );
   matchesPerLine.forEach((matchIndices, lineIndex) => {
     matchIndices.forEach((matchColumn) => {
-      sampleCount++
-      const position = { line: lineIndex + 1, column: matchColumn }
-      const result = consumer.originalPositionFor(position)
+      sampleCount += 1;
+      const position = { line: lineIndex + 1, column: matchColumn };
+      const result = consumer.originalPositionFor(position);
       // warn if source content is missing
       if (!result.source) {
-        console.warn(`!! missing source for position: ${JSON.stringify(position)}`)
-        // const buildLine = buildLines[position.line - 1]
-        console.warn(`   origin in build:`)
-        console.warn(`   ${buildLines[position.line - 2]}`)
-        console.warn(`-> ${buildLines[position.line - 1]}`)
-        console.warn(`   ${buildLines[position.line - 0]}`)
-        return
+        valid = false;
+        const location = {
+          start: { line: position.line, column: position.column + 1 },
+        };
+        const codeSample = codeFrameColumns(rawBuild, location, {
+          message: `missing source for position`,
+          highlightCode: true,
+        });
+        console.error(
+          `missing source for position, in bundle "${buildName}"\n${codeSample}`,
+        );
+        return;
       }
-      const sourceContent = consumer.sourceContentFor(result.source)
-      const sourceLines = sourceContent.split('\n')
-      const line = sourceLines[result.line - 1]
+      const sourceContent = consumer.sourceContentFor(result.source);
+      const sourceLines = sourceContent.split('\n');
+      const sourceLine = sourceLines[result.line - 1];
       // this sometimes includes the whole line though we tried to match somewhere in the middle
-      const portion = line.slice(result.column)
-      const isMaybeValid = portion.includes(targetString)
-      if (!isMaybeValid) {
-        console.error('Sourcemap seems invalid:')
-        console.log(`\n========================== ${result.source} ====================================\n`)
-        console.log(line)
-        console.log(`\n==============================================================================\n`)
+      const portion = sourceLine.slice(result.column);
+      const foundValidSource = portion.includes(targetString);
+      if (!foundValidSource) {
+        valid = false;
+        const location = {
+          start: { line: result.line + 1, column: result.column + 1 },
+        };
+        const codeSample = codeFrameColumns(sourceContent, location, {
+          message: `expected to see ${JSON.stringify(targetString)}`,
+          highlightCode: true,
+        });
+        console.error(
+          `Sourcemap seems invalid, ${result.source}\n${codeSample}`,
+        );
       }
-    })
-  })
-  console.log(`  checked ${sampleCount} samples`)
+    });
+  });
+  console.log(`  checked ${sampleCount} samples`);
+  return valid;
 }
 
-function indicesOf (substring, string) {
-  const a = []
-  let i = -1
+function indicesOf(substring, string) {
+  const a = [];
+  let i = -1;
   while ((i = string.indexOf(substring, i + 1)) >= 0) {
-    a.push(i)
+    a.push(i);
   }
-  return a
+  return a;
 }

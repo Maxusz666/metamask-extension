@@ -1,82 +1,94 @@
-import Web3 from 'web3'
-import contracts from 'eth-contract-metadata'
-import { warn } from 'loglevel'
-import { MAINNET } from './network/enums'
-// By default, poll every 3 minutes
-const DEFAULT_INTERVAL = 180 * 1000
-const ERC20_ABI = [{ 'constant': true, 'inputs': [{ 'name': '_owner', 'type': 'address' }], 'name': 'balanceOf', 'outputs': [{ 'name': 'balance', 'type': 'uint256' }], 'payable': false, 'type': 'function' }]
-import SINGLE_CALL_BALANCES_ABI from 'single-call-balance-checker-abi'
+import Web3 from 'web3';
+import contracts from '@metamask/contract-metadata';
+import { warn } from 'loglevel';
+import SINGLE_CALL_BALANCES_ABI from 'single-call-balance-checker-abi';
+import { MAINNET_CHAIN_ID } from '../../../shared/constants/network';
+import { SINGLE_CALL_BALANCES_ADDRESS } from '../constants/contracts';
+import { MINUTE } from '../../../shared/constants/time';
 
-const SINGLE_CALL_BALANCES_ADDRESS = '0xb1f8e55c7f64d203c1400b9d8555d050f94adf39'
+// By default, poll every 3 minutes
+const DEFAULT_INTERVAL = MINUTE * 3;
+
 /**
  * A controller that polls for token exchange
  * rates based on a user's current token list
  */
-class DetectTokensController {
+export default class DetectTokensController {
   /**
    * Creates a DetectTokensController
    *
    * @param {Object} [config] - Options to configure controller
    */
-  constructor ({ interval = DEFAULT_INTERVAL, preferences, network, keyringMemStore } = {}) {
-    this.preferences = preferences
-    this.interval = interval
-    this.network = network
-    this.keyringMemStore = keyringMemStore
+  constructor({
+    interval = DEFAULT_INTERVAL,
+    preferences,
+    network,
+    keyringMemStore,
+  } = {}) {
+    this.preferences = preferences;
+    this.interval = interval;
+    this.network = network;
+    this.keyringMemStore = keyringMemStore;
   }
 
   /**
-   * For each token in eth-contract-metada, find check selectedAddress balance.
-   *
+   * For each token in @metamask/contract-metadata, find check selectedAddress balance.
    */
-  async detectNewTokens () {
+  async detectNewTokens() {
     if (!this.isActive) {
-      return
+      return;
     }
-    if (this._network.store.getState().provider.type !== MAINNET) {
-      return
+    if (this._network.store.getState().provider.chainId !== MAINNET_CHAIN_ID) {
+      return;
     }
-    const tokensToDetect = []
-    this.web3.setProvider(this._network._provider)
+
+    const tokensToDetect = [];
+    this.web3.setProvider(this._network._provider);
     for (const contractAddress in contracts) {
-      if (contracts[contractAddress].erc20 && !(this.tokenAddresses.includes(contractAddress.toLowerCase()))) {
-        tokensToDetect.push(contractAddress)
+      if (
+        contracts[contractAddress].erc20 &&
+        !this.tokenAddresses.includes(contractAddress.toLowerCase()) &&
+        !this.hiddenTokens.includes(contractAddress.toLowerCase())
+      ) {
+        tokensToDetect.push(contractAddress);
       }
     }
 
-    const ethContract = this.web3.eth.contract(SINGLE_CALL_BALANCES_ABI).at(SINGLE_CALL_BALANCES_ADDRESS)
-    ethContract.balances([this.selectedAddress], tokensToDetect, (error, result) => {
-      if (error) {
-        warn(`MetaMask - DetectTokensController single call balance fetch failed`, error)
-        return
+    let result;
+    try {
+      result = await this._getTokenBalances(tokensToDetect);
+    } catch (error) {
+      warn(
+        `MetaMask - DetectTokensController single call balance fetch failed`,
+        error,
+      );
+      return;
+    }
+
+    tokensToDetect.forEach((tokenAddress, index) => {
+      const balance = result[index];
+      if (balance && !balance.isZero()) {
+        this._preferences.addToken(
+          tokenAddress,
+          contracts[tokenAddress].symbol,
+          contracts[tokenAddress].decimals,
+        );
       }
-      tokensToDetect.forEach((tokenAddress, index) => {
-        const balance = result[index]
-        if (balance && !balance.isZero()) {
-          this._preferences.addToken(tokenAddress, contracts[tokenAddress].symbol, contracts[tokenAddress].decimals)
-        }
-      })
-    })
+    });
   }
 
-  /**
-   * Find if selectedAddress has tokens with contract in contractAddress.
-   *
-   * @param {string} contractAddress - Hex address of the token contract to explore.
-   * @returns {boolean} - If balance is detected, token is added.
-   *
-   */
-  async detectTokenBalance (contractAddress) {
-    const ethContract = this.web3.eth.contract(ERC20_ABI).at(contractAddress)
-    ethContract.balanceOf(this.selectedAddress, (error, result) => {
-      if (!error) {
-        if (!result.isZero()) {
-          this._preferences.addToken(contractAddress, contracts[contractAddress].symbol, contracts[contractAddress].decimals)
+  async _getTokenBalances(tokens) {
+    const ethContract = this.web3.eth
+      .contract(SINGLE_CALL_BALANCES_ABI)
+      .at(SINGLE_CALL_BALANCES_ADDRESS);
+    return new Promise((resolve, reject) => {
+      ethContract.balances([this.selectedAddress], tokens, (error, result) => {
+        if (error) {
+          return reject(error);
         }
-      } else {
-        warn(`MetaMask - DetectTokensController balance fetch failed for ${contractAddress}.`, error)
-      }
-    })
+        return resolve(result);
+      });
+    });
   }
 
   /**
@@ -84,86 +96,92 @@ class DetectTokensController {
    * in case of address change or user session initialization.
    *
    */
-  restartTokenDetection () {
+  restartTokenDetection() {
     if (!(this.isActive && this.selectedAddress)) {
-      return
+      return;
     }
-    this.detectNewTokens()
-    this.interval = DEFAULT_INTERVAL
+    this.detectNewTokens();
+    this.interval = DEFAULT_INTERVAL;
   }
 
+  /* eslint-disable accessor-pairs */
   /**
    * @type {Number}
    */
-  set interval (interval) {
-    this._handle && clearInterval(this._handle)
+  set interval(interval) {
+    this._handle && clearInterval(this._handle);
     if (!interval) {
-      return
+      return;
     }
     this._handle = setInterval(() => {
-      this.detectNewTokens()
-    }, interval)
+      this.detectNewTokens();
+    }, interval);
   }
 
   /**
    * In setter when selectedAddress is changed, detectNewTokens and restart polling
    * @type {Object}
    */
-  set preferences (preferences) {
+  set preferences(preferences) {
     if (!preferences) {
-      return
+      return;
     }
-    this._preferences = preferences
-    preferences.store.subscribe(({ tokens = [] }) => {
-      this.tokenAddresses = tokens.map((obj) => {
-        return obj.address
-      })
-    })
+    this._preferences = preferences;
+    const currentTokens = preferences.store.getState().tokens;
+    this.tokenAddresses = currentTokens
+      ? currentTokens.map((token) => token.address)
+      : [];
+    this.hiddenTokens = preferences.store.getState().hiddenTokens;
+    preferences.store.subscribe(({ tokens = [], hiddenTokens = [] }) => {
+      this.tokenAddresses = tokens.map((token) => {
+        return token.address;
+      });
+      this.hiddenTokens = hiddenTokens;
+    });
     preferences.store.subscribe(({ selectedAddress }) => {
       if (this.selectedAddress !== selectedAddress) {
-        this.selectedAddress = selectedAddress
-        this.restartTokenDetection()
+        this.selectedAddress = selectedAddress;
+        this.restartTokenDetection();
       }
-    })
+    });
   }
 
   /**
    * @type {Object}
    */
-  set network (network) {
+  set network(network) {
     if (!network) {
-      return
+      return;
     }
-    this._network = network
-    this.web3 = new Web3(network._provider)
+    this._network = network;
+    this.web3 = new Web3(network._provider);
   }
 
   /**
    * In setter when isUnlocked is updated to true, detectNewTokens and restart polling
    * @type {Object}
    */
-  set keyringMemStore (keyringMemStore) {
+  set keyringMemStore(keyringMemStore) {
     if (!keyringMemStore) {
-      return
+      return;
     }
-    this._keyringMemStore = keyringMemStore
+    this._keyringMemStore = keyringMemStore;
     this._keyringMemStore.subscribe(({ isUnlocked }) => {
       if (this.isUnlocked !== isUnlocked) {
-        this.isUnlocked = isUnlocked
+        this.isUnlocked = isUnlocked;
         if (isUnlocked) {
-          this.restartTokenDetection()
+          this.restartTokenDetection();
         }
       }
-    })
+    });
   }
 
   /**
    * Internal isActive state
    * @type {Object}
    */
-  get isActive () {
-    return this.isOpen && this.isUnlocked
+  get isActive() {
+    return this.isOpen && this.isUnlocked;
   }
+  /* eslint-enable accessor-pairs */
 }
-
-export default DetectTokensController

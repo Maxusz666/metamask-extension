@@ -1,42 +1,57 @@
-import ObservableStore from 'obs-store'
-import { addInternalMethodPrefix } from './permissions'
-import { normalize as normalizeAddress } from 'eth-sig-util'
-import { isValidAddress, sha3, bufferToHex } from 'ethereumjs-util'
+import { strict as assert } from 'assert';
+import { ObservableStore } from '@metamask/obs-store';
+import { ethErrors } from 'eth-rpc-errors';
+import { normalize as normalizeAddress } from 'eth-sig-util';
+import { ethers } from 'ethers';
+import log from 'loglevel';
+import abiERC721 from 'human-standard-collectible-abi';
+import contractsMap from '@metamask/contract-metadata';
+import { LISTED_CONTRACT_ADDRESSES } from '../../../shared/constants/tokens';
+import { NETWORK_TYPE_TO_ID_MAP } from '../../../shared/constants/network';
+import { isPrefixedFormattedHexString } from '../../../shared/modules/network.utils';
+import {
+  isValidHexAddress,
+  toChecksumHexAddress,
+} from '../../../shared/modules/hexstring-utils';
+import { NETWORK_EVENTS } from './network';
 
-class PreferencesController {
+const ERC721_INTERFACE_ID = '0x80ac58cd';
 
+export default class PreferencesController {
   /**
    *
    * @typedef {Object} PreferencesController
    * @param {Object} opts - Overrides the defaults for the initial state of this.store
-   * @property {object} store The stored object containing a users preferences, stored in local storage
-	 * @property {array} store.frequentRpcList A list of custom rpcs to provide the user
-   * @property {string} store.currentAccountTab Indicates the selected tab in the ui
-   * @property {array} store.tokens The tokens the user wants display in their token lists
-   * @property {object} store.accountTokens The tokens stored per account and then per network type
-   * @property {object} store.assetImages Contains assets objects related to assets added
+   * @property {Object} store The stored object containing a users preferences, stored in local storage
+   * @property {Array} store.frequentRpcList A list of custom rpcs to provide the user
+   * @property {Array} store.tokens The tokens the user wants display in their token lists
+   * @property {Object} store.accountTokens The tokens stored per account and then per network type
+   * @property {Object} store.assetImages Contains assets objects related to assets added
    * @property {boolean} store.useBlockie The users preference for blockie identicons within the UI
    * @property {boolean} store.useNonceField The users preference for nonce field within the UI
-   * @property {object} store.featureFlags A key-boolean map, where keys refer to features and booleans to whether the
+   * @property {Object} store.featureFlags A key-boolean map, where keys refer to features and booleans to whether the
    * user wishes to see that feature.
    *
    * Feature flags can be set by the global function `setPreference(feature, enabled)`, and so should not expose any sensitive behavior.
-   * @property {object} store.knownMethodData Contains all data methods known by the user
+   * @property {Object} store.knownMethodData Contains all data methods known by the user
    * @property {string} store.currentLocale The preferred language locale key
    * @property {string} store.selectedAddress A hex string that matches the currently selected address in the app
    *
    */
-  constructor (opts = {}) {
-    const initState = Object.assign({
+  constructor(opts = {}) {
+    const initState = {
       frequentRpcListDetail: [],
-      currentAccountTab: 'history',
       accountTokens: {},
+      accountHiddenTokens: {},
       assetImages: {},
       tokens: [],
+      hiddenTokens: [],
       suggestedTokens: {},
       useBlockie: false,
       useNonceField: false,
       usePhishDetect: true,
+      dismissSeedBackUpReminder: false,
+      useStaticTokenList: false,
 
       // WARNING: Do not use feature flags for security-sensitive things.
       // Feature flag toggling is available in the global namespace
@@ -44,35 +59,45 @@ class PreferencesController {
       // perform sensitive operations.
       featureFlags: {
         showIncomingTransactions: true,
-        transactionTime: false,
       },
       knownMethodData: {},
-      participateInMetaMetrics: null,
       firstTimeFlowType: null,
       currentLocale: opts.initLangCode,
       identities: {},
       lostIdentities: {},
       forgottenPassword: false,
       preferences: {
+        autoLockTimeLimit: undefined,
+        showFiatInTestnets: false,
         useNativeCurrencyAsPrimaryCurrency: true,
+        hideZeroBalanceTokens: false,
       },
       completedOnboarding: false,
-      metaMetricsId: null,
-      metaMetricsSendCount: 0,
-
       // ENS decentralized website resolution
-      ipfsGateway: 'ipfs.dweb.link',
-    }, opts.initState)
+      ipfsGateway: 'dweb.link',
+      infuraBlocked: null,
+      useLedgerLive: false,
+      ...opts.initState,
+    };
 
-    this.diagnostics = opts.diagnostics
-    this.network = opts.network
-    this.store = new ObservableStore(initState)
-    this.openPopup = opts.openPopup
-    this._subscribeProviderType()
+    this.network = opts.network;
+    this.ethersProvider = new ethers.providers.Web3Provider(opts.provider);
+    this.store = new ObservableStore(initState);
+    this.store.setMaxListeners(12);
+    this.openPopup = opts.openPopup;
+    this.migrateAddressBookState = opts.migrateAddressBookState;
+
+    this.network.on(NETWORK_EVENTS.NETWORK_DID_CHANGE, () => {
+      const { tokens, hiddenTokens } = this._getTokenRelatedStates();
+      this.ethersProvider = new ethers.providers.Web3Provider(opts.provider);
+      this._updateAccountTokens(tokens, this.getAssetImages(), hiddenTokens);
+    });
+
+    this._subscribeToInfuraAvailability();
 
     global.setPreference = (key, value) => {
-      return this.setFeatureFlag(key, value)
-    }
+      return this.setFeatureFlag(key, value);
+    };
   }
   // PUBLIC METHODS
 
@@ -80,8 +105,8 @@ class PreferencesController {
    * Sets the {@code forgottenPassword} state property
    * @param {boolean} forgottenPassword - whether or not the user has forgotten their password
    */
-  setPasswordForgotten (forgottenPassword) {
-    this.store.updateState({ forgottenPassword })
+  setPasswordForgotten(forgottenPassword) {
+    this.store.updateState({ forgottenPassword });
   }
 
   /**
@@ -90,8 +115,8 @@ class PreferencesController {
    * @param {boolean} val - Whether or not the user prefers blockie indicators
    *
    */
-  setUseBlockie (val) {
-    this.store.updateState({ useBlockie: val })
+  setUseBlockie(val) {
+    this.store.updateState({ useBlockie: val });
   }
 
   /**
@@ -100,8 +125,8 @@ class PreferencesController {
    * @param {boolean} val - Whether or not the user prefers to set nonce
    *
    */
-  setUseNonceField (val) {
-    this.store.updateState({ useNonceField: val })
+  setUseNonceField(val) {
+    this.store.updateState({ useNonceField: val });
   }
 
   /**
@@ -110,35 +135,18 @@ class PreferencesController {
    * @param {boolean} val - Whether or not the user prefers phishing domain protection
    *
    */
-  setUsePhishDetect (val) {
-    this.store.updateState({ usePhishDetect: val })
+  setUsePhishDetect(val) {
+    this.store.updateState({ usePhishDetect: val });
   }
 
   /**
-   * Setter for the `participateInMetaMetrics` property
+   * Setter for the `useStaticTokenList` property
    *
-   * @param {boolean} bool - Whether or not the user wants to participate in MetaMetrics
-   * @returns {string|null} - the string of the new metametrics id, or null if not set
+   * @param {boolean} val - Whether or not the user prefers to use the static token list or dynamic token list from the API
    *
    */
-  setParticipateInMetaMetrics (bool) {
-    this.store.updateState({ participateInMetaMetrics: bool })
-    let metaMetricsId = null
-    if (bool && !this.store.getState().metaMetricsId) {
-      metaMetricsId = bufferToHex(sha3(String(Date.now()) + String(Math.round(Math.random() * Number.MAX_SAFE_INTEGER))))
-      this.store.updateState({ metaMetricsId })
-    } else if (bool === false) {
-      this.store.updateState({ metaMetricsId })
-    }
-    return metaMetricsId
-  }
-
-  getParticipateInMetaMetrics () {
-    return this.store.getState().participateInMetaMetrics
-  }
-
-  setMetaMetricsSendCount (val) {
-    this.store.updateState({ metaMetricsSendCount: val })
+  setUseStaticTokenList(val) {
+    this.store.updateState({ useStaticTokenList: val });
   }
 
   /**
@@ -147,27 +155,16 @@ class PreferencesController {
    * @param {string} type - Indicates the type of first time flow - create or import - the user wishes to follow
    *
    */
-  setFirstTimeFlowType (type) {
-    this.store.updateState({ firstTimeFlowType: type })
+  setFirstTimeFlowType(type) {
+    this.store.updateState({ firstTimeFlowType: type });
   }
 
-
-  getSuggestedTokens () {
-    return this.store.getState().suggestedTokens
+  getSuggestedTokens() {
+    return this.store.getState().suggestedTokens;
   }
 
-  getAssetImages () {
-    return this.store.getState().assetImages
-  }
-
-  addSuggestedERC20Asset (tokenOpts) {
-    this._validateERC20AssetParams(tokenOpts)
-    const suggested = this.getSuggestedTokens()
-    const { rawAddress, symbol, decimals, image } = tokenOpts
-    const address = normalizeAddress(rawAddress)
-    const newEntry = { address, symbol, decimals, image }
-    suggested[address] = newEntry
-    this.store.updateState({ suggestedTokens: suggested })
+  getAssetImages() {
+    return this.store.getState().assetImages;
   }
 
   /**
@@ -176,41 +173,27 @@ class PreferencesController {
    * @param {string} fourBytePrefix - Four-byte method signature
    * @param {string} methodData - Corresponding data method
    */
-  addKnownMethodData (fourBytePrefix, methodData) {
-    const knownMethodData = this.store.getState().knownMethodData
-    knownMethodData[fourBytePrefix] = methodData
-    this.store.updateState({ knownMethodData })
+  addKnownMethodData(fourBytePrefix, methodData) {
+    const { knownMethodData } = this.store.getState();
+    knownMethodData[fourBytePrefix] = methodData;
+    this.store.updateState({ knownMethodData });
   }
 
   /**
-   * RPC engine middleware for requesting new asset added
+   * wallet_watchAsset request handler.
    *
-   * @param req
-   * @param res
-   * @param {Function} - next
-   * @param {Function} - end
+   * @param {Object} req - The watchAsset JSON-RPC request object.
    */
-  async requestWatchAsset (req, res, next, end) {
-    if (
-      req.method === 'metamask_watchAsset' ||
-      req.method === addInternalMethodPrefix('watchAsset')
-    ) {
-      const { type, options } = req.params
-      switch (type) {
-        case 'ERC20':
-          const result = await this._handleWatchAssetERC20(options)
-          if (result instanceof Error) {
-            end(result)
-          } else {
-            res.result = result
-            end()
-          }
-          break
-        default:
-          end(new Error(`Asset of type ${type} not supported`))
-      }
-    } else {
-      next()
+  async requestWatchAsset(req) {
+    const { type, options } = req.params;
+
+    switch (type) {
+      case 'ERC20':
+        return await this._handleWatchAssetERC20(options);
+      default:
+        throw ethErrors.rpc.invalidParams(
+          `Asset of type "${type}" not supported.`,
+        );
     }
   }
 
@@ -220,13 +203,15 @@ class PreferencesController {
    * @param {string} key - he preferred language locale key
    *
    */
-  setCurrentLocale (key) {
-    const textDirection = (['ar', 'dv', 'fa', 'he', 'ku'].includes(key)) ? 'rtl' : 'auto'
+  setCurrentLocale(key) {
+    const textDirection = ['ar', 'dv', 'fa', 'he', 'ku'].includes(key)
+      ? 'rtl'
+      : 'auto';
     this.store.updateState({
       currentLocale: key,
-      textDirection: textDirection,
-    })
-    return textDirection
+      textDirection,
+    });
+    return textDirection;
   }
 
   /**
@@ -236,48 +221,58 @@ class PreferencesController {
    * @param {string[]} addresses - An array of hex addresses
    *
    */
-  setAddresses (addresses) {
-    const oldIdentities = this.store.getState().identities
-    const oldAccountTokens = this.store.getState().accountTokens
+  setAddresses(addresses) {
+    const oldIdentities = this.store.getState().identities;
+    const oldAccountTokens = this.store.getState().accountTokens;
+    const oldAccountHiddenTokens = this.store.getState().accountHiddenTokens;
 
     const identities = addresses.reduce((ids, address, index) => {
-      const oldId = oldIdentities[address] || {}
-      ids[address] = { name: `Account ${index + 1}`, address, ...oldId }
-      return ids
-    }, {})
+      const oldId = oldIdentities[address] || {};
+      ids[address] = { name: `Account ${index + 1}`, address, ...oldId };
+      return ids;
+    }, {});
     const accountTokens = addresses.reduce((tokens, address) => {
-      const oldTokens = oldAccountTokens[address] || {}
-      tokens[address] = oldTokens
-      return tokens
-    }, {})
-    this.store.updateState({ identities, accountTokens })
+      const oldTokens = oldAccountTokens[address] || {};
+      tokens[address] = oldTokens;
+      return tokens;
+    }, {});
+    const accountHiddenTokens = addresses.reduce((hiddenTokens, address) => {
+      const oldHiddenTokens = oldAccountHiddenTokens[address] || {};
+      hiddenTokens[address] = oldHiddenTokens;
+      return hiddenTokens;
+    }, {});
+    this.store.updateState({ identities, accountTokens, accountHiddenTokens });
   }
 
   /**
    * Removes an address from state
    *
    * @param {string} address - A hex address
-   * @returns {string} - the address that was removed
+   * @returns {string} the address that was removed
    */
-  removeAddress (address) {
-    const identities = this.store.getState().identities
-    const accountTokens = this.store.getState().accountTokens
+  removeAddress(address) {
+    const {
+      identities,
+      accountTokens,
+      accountHiddenTokens,
+    } = this.store.getState();
+
     if (!identities[address]) {
-      throw new Error(`${address} can't be deleted cause it was not found`)
+      throw new Error(`${address} can't be deleted cause it was not found`);
     }
-    delete identities[address]
-    delete accountTokens[address]
-    this.store.updateState({ identities, accountTokens })
+    delete identities[address];
+    delete accountTokens[address];
+    delete accountHiddenTokens[address];
+    this.store.updateState({ identities, accountTokens, accountHiddenTokens });
 
     // If the selected account is no longer valid,
     // select an arbitrary other account:
     if (address === this.getSelectedAddress()) {
-      const selected = Object.keys(identities)[0]
-      this.setSelectedAddress(selected)
+      const selected = Object.keys(identities)[0];
+      this.setSelectedAddress(selected);
     }
-    return address
+    return address;
   }
-
 
   /**
    * Adds addresses to the identities object without removing identities
@@ -285,21 +280,25 @@ class PreferencesController {
    * @param {string[]} addresses - An array of hex addresses
    *
    */
-  addAddresses (addresses) {
-    const identities = this.store.getState().identities
-    const accountTokens = this.store.getState().accountTokens
+  addAddresses(addresses) {
+    const {
+      identities,
+      accountTokens,
+      accountHiddenTokens,
+    } = this.store.getState();
     addresses.forEach((address) => {
       // skip if already exists
       if (identities[address]) {
-        return
+        return;
       }
       // add missing identity
-      const identityCount = Object.keys(identities).length
+      const identityCount = Object.keys(identities).length;
 
-      accountTokens[address] = {}
-      identities[address] = { name: `Account ${identityCount + 1}`, address }
-    })
-    this.store.updateState({ identities, accountTokens })
+      accountTokens[address] = {};
+      accountHiddenTokens[address] = {};
+      identities[address] = { name: `Account ${identityCount + 1}`, address };
+    });
+    this.store.updateState({ identities, accountTokens, accountHiddenTokens });
   }
 
   /**
@@ -307,82 +306,82 @@ class PreferencesController {
    * Removes any unknown identities, and returns the resulting selected address.
    *
    * @param {Array<string>} addresses - known to the vault.
-   * @returns {Promise<string>} - selectedAddress the selected address.
+   * @returns {Promise<string>} selectedAddress the selected address.
    */
-  syncAddresses (addresses) {
-
+  syncAddresses(addresses) {
     if (!Array.isArray(addresses) || addresses.length === 0) {
-      throw new Error('Expected non-empty array of addresses.')
+      throw new Error('Expected non-empty array of addresses. Error #11201');
     }
 
-    const { identities, lostIdentities } = this.store.getState()
+    const { identities, lostIdentities } = this.store.getState();
 
-    const newlyLost = {}
+    const newlyLost = {};
     Object.keys(identities).forEach((identity) => {
       if (!addresses.includes(identity)) {
-        newlyLost[identity] = identities[identity]
-        delete identities[identity]
+        newlyLost[identity] = identities[identity];
+        delete identities[identity];
       }
-    })
+    });
 
     // Identities are no longer present.
     if (Object.keys(newlyLost).length > 0) {
-
-      // Notify our servers:
-      if (this.diagnostics) {
-        this.diagnostics.reportOrphans(newlyLost)
-      }
-
       // store lost accounts
-      for (const key in newlyLost) {
-        lostIdentities[key] = newlyLost[key]
-      }
+      Object.keys(newlyLost).forEach((key) => {
+        lostIdentities[key] = newlyLost[key];
+      });
     }
 
-    this.store.updateState({ identities, lostIdentities })
-    this.addAddresses(addresses)
+    this.store.updateState({ identities, lostIdentities });
+    this.addAddresses(addresses);
 
     // If the selected account is no longer valid,
     // select an arbitrary other account:
-    let selected = this.getSelectedAddress()
+    let selected = this.getSelectedAddress();
     if (!addresses.includes(selected)) {
-      selected = addresses[0]
-      this.setSelectedAddress(selected)
+      selected = addresses[0];
+      this.setSelectedAddress(selected);
     }
 
-    return selected
+    return selected;
   }
 
-  removeSuggestedTokens () {
+  removeSuggestedTokens() {
     return new Promise((resolve) => {
-      this.store.updateState({ suggestedTokens: {} })
-      resolve({})
-    })
+      this.store.updateState({ suggestedTokens: {} });
+      resolve({});
+    });
   }
 
   /**
    * Setter for the `selectedAddress` property
    *
    * @param {string} _address - A new hex address for an account
-   * @returns {Promise<void>} - Promise resolves with tokens
+   * @returns {Promise<void>} Promise resolves with tokens
    *
    */
-  setSelectedAddress (_address) {
-    const address = normalizeAddress(_address)
-    this._updateTokens(address)
-    this.store.updateState({ selectedAddress: address })
-    const tokens = this.store.getState().tokens
-    return Promise.resolve(tokens)
+  setSelectedAddress(_address) {
+    const address = normalizeAddress(_address);
+    this._updateTokens(address);
+
+    const { identities, tokens } = this.store.getState();
+    const selectedIdentity = identities[address];
+    if (!selectedIdentity) {
+      throw new Error(`Identity for '${address} not found`);
+    }
+
+    selectedIdentity.lastSelected = Date.now();
+    this.store.updateState({ identities, selectedAddress: address });
+    return Promise.resolve(tokens);
   }
 
   /**
    * Getter for the `selectedAddress` property
    *
-   * @returns {string} - The hex address for the currently selected account
+   * @returns {string} The hex address for the currently selected account
    *
    */
-  getSelectedAddress () {
-    return this.store.getState().selectedAddress
+  getSelectedAddress() {
+    return this.store.getState().selectedAddress;
   }
 
   /**
@@ -396,60 +395,86 @@ class PreferencesController {
    */
 
   /**
-   * Adds a new token to the token array, or updates the token if passed an address that already exists.
+   * Adds a new token to the token array and removes it from the hiddenToken array, or updates the token if passed an address that already exists.
    * Modifies the existing tokens array from the store. All objects in the tokens array array AddedToken objects.
    * @see AddedToken {@link AddedToken}
    *
    * @param {string} rawAddress - Hex address of the token contract. May or may not be a checksum address.
    * @param {string} symbol - The symbol of the token
-   * @param {number} decimals  - The number of decimals the token uses.
-   * @returns {Promise<array>} - Promises the new array of AddedToken objects.
+   * @param {number} decimals - The number of decimals the token uses.
+   * @returns {Promise<array>} Promises the new array of AddedToken objects.
    *
    */
-  async addToken (rawAddress, symbol, decimals, image) {
-    const address = normalizeAddress(rawAddress)
-    const newEntry = { address, symbol, decimals }
-    const tokens = this.store.getState().tokens
-    const assetImages = this.getAssetImages()
+  async addToken(rawAddress, symbol, decimals, image) {
+    const address = normalizeAddress(rawAddress);
+    const newEntry = { address, symbol, decimals: Number(decimals) };
+    const { tokens, hiddenTokens } = this.store.getState();
+    const assetImages = this.getAssetImages();
+    const updatedHiddenTokens = hiddenTokens.filter(
+      (tokenAddress) => tokenAddress !== rawAddress.toLowerCase(),
+    );
     const previousEntry = tokens.find((token) => {
-      return token.address === address
-    })
-    const previousIndex = tokens.indexOf(previousEntry)
+      return token.address === address;
+    });
+    const previousIndex = tokens.indexOf(previousEntry);
+
+    newEntry.isERC721 = await this._detectIsERC721(newEntry.address);
 
     if (previousEntry) {
-      tokens[previousIndex] = newEntry
+      tokens[previousIndex] = newEntry;
     } else {
-      tokens.push(newEntry)
+      tokens.push(newEntry);
     }
-    assetImages[address] = image
-    this._updateAccountTokens(tokens, assetImages)
-    return Promise.resolve(tokens)
+    assetImages[address] = image;
+    this._updateAccountTokens(tokens, assetImages, updatedHiddenTokens);
+    return Promise.resolve(tokens);
   }
 
   /**
-   * Removes a specified token from the tokens array.
+   * Adds isERC721 field to token object
+   * (Called when a user attempts to add tokens that were previously added which do not yet had isERC721 field)
    *
-   * @param {string} rawAddress - Hex address of the token contract to remove.
-   * @returns {Promise<array>} - The new array of AddedToken objects
+   * @param {string} tokenAddress - The contract address of the token requiring the isERC721 field added.
+   * @returns {Promise<object>} The new token object with the added isERC721 field.
    *
    */
-  removeToken (rawAddress) {
-    const tokens = this.store.getState().tokens
-    const assetImages = this.getAssetImages()
-    const updatedTokens = tokens.filter((token) => token.address !== rawAddress)
-    delete assetImages[rawAddress]
-    this._updateAccountTokens(updatedTokens, assetImages)
-    return Promise.resolve(updatedTokens)
+  async updateTokenType(tokenAddress) {
+    const { tokens } = this.store.getState();
+    const tokenIndex = tokens.findIndex((token) => {
+      return token.address === tokenAddress;
+    });
+    tokens[tokenIndex].isERC721 = await this._detectIsERC721(tokenAddress);
+    this.store.updateState({ tokens });
+    return Promise.resolve(tokens[tokenIndex]);
+  }
+
+  /**
+   * Removes a specified token from the tokens array and adds it to hiddenTokens array
+   *
+   * @param {string} rawAddress - Hex address of the token contract to remove.
+   * @returns {Promise<array>} The new array of AddedToken objects
+   *
+   */
+  removeToken(rawAddress) {
+    const { tokens, hiddenTokens } = this.store.getState();
+    const assetImages = this.getAssetImages();
+    const updatedTokens = tokens.filter(
+      (token) => token.address !== rawAddress,
+    );
+    const updatedHiddenTokens = [...hiddenTokens, rawAddress.toLowerCase()];
+    delete assetImages[rawAddress];
+    this._updateAccountTokens(updatedTokens, assetImages, updatedHiddenTokens);
+    return Promise.resolve(updatedTokens);
   }
 
   /**
    * A getter for the `tokens` property
    *
-   * @returns {array} - The current array of AddedToken objects
+   * @returns {Array} The current array of AddedToken objects
    *
    */
-  getTokens () {
-    return this.store.getState().tokens
+  getTokens() {
+    return this.store.getState().tokens;
   }
 
   /**
@@ -458,116 +483,158 @@ class PreferencesController {
    * @param {string} label - the custom label for the account
    * @returns {Promise<string>}
    */
-  setAccountLabel (account, label) {
+  setAccountLabel(account, label) {
     if (!account) {
-      throw new Error('setAccountLabel requires a valid address, got ' + String(account))
+      throw new Error(
+        `setAccountLabel requires a valid address, got ${String(account)}`,
+      );
     }
-    const address = normalizeAddress(account)
-    const { identities } = this.store.getState()
-    identities[address] = identities[address] || {}
-    identities[address].name = label
-    this.store.updateState({ identities })
-    return Promise.resolve(label)
-  }
-
-  /**
-   * Setter for the `currentAccountTab` property
-   *
-   * @param {string} currentAccountTab - Specifies the new tab to be marked as current
-   * @returns {Promise<void>} - Promise resolves with undefined
-   *
-   */
-  setCurrentAccountTab (currentAccountTab) {
-    return new Promise((resolve) => {
-      this.store.updateState({ currentAccountTab })
-      resolve()
-    })
+    const address = normalizeAddress(account);
+    const { identities } = this.store.getState();
+    identities[address] = identities[address] || {};
+    identities[address].name = label;
+    this.store.updateState({ identities });
+    return Promise.resolve(label);
   }
 
   /**
    * updates custom RPC details
    *
-   * @param {string} url - The RPC url to add to frequentRpcList.
-   * @param {number} chainId - Optional chainId of the selected network.
-   * @param {string} ticker   - Optional ticker symbol of the selected network.
-   * @param {string} nickname - Optional nickname of the selected network.
-   * @returns {Promise<array>} - Promise resolving to updated frequentRpcList.
+   * @param {Object} newRpcDetails - Options bag.
+   * @param {string} newRpcDetails.rpcUrl - The RPC url to add to frequentRpcList.
+   * @param {string} newRpcDetails.chainId - The chainId of the selected network.
+   * @param {string} [newRpcDetails.ticker] - Optional ticker symbol of the selected network.
+   * @param {string} [newRpcDetails.nickname] - Optional nickname of the selected network.
+   * @param {Object} [newRpcDetails.rpcPrefs] - Optional RPC preferences, such as the block explorer URL
    *
    */
-
-
-  updateRpc (newRpcDetails) {
-    const rpcList = this.getFrequentRpcListDetail()
+  async updateRpc(newRpcDetails) {
+    const rpcList = this.getFrequentRpcListDetail();
     const index = rpcList.findIndex((element) => {
-      return element.rpcUrl === newRpcDetails.rpcUrl
-    })
+      return element.rpcUrl === newRpcDetails.rpcUrl;
+    });
     if (index > -1) {
-      const rpcDetail = rpcList[index]
-      const updatedRpc = { ...rpcDetail, ...newRpcDetails }
-      rpcList[index] = updatedRpc
-      this.store.updateState({ frequentRpcListDetail: rpcList })
+      const rpcDetail = rpcList[index];
+      const updatedRpc = { ...rpcDetail, ...newRpcDetails };
+      if (rpcDetail.chainId !== updatedRpc.chainId) {
+        // When the chainId is changed, associated address book entries should
+        // also be migrated. The address book entries are keyed by the `network` state,
+        // which for custom networks is the chainId with a fallback to the networkId
+        // if the chainId is not set.
+
+        let addressBookKey = rpcDetail.chainId;
+        if (!addressBookKey) {
+          // We need to find the networkId to determine what these addresses were keyed by
+          try {
+            addressBookKey = await this.ethersProvider.send('net_version');
+            assert(typeof addressBookKey === 'string');
+          } catch (error) {
+            log.debug(error);
+            log.warn(
+              `Failed to get networkId from ${rpcDetail.rpcUrl}; skipping address book migration`,
+            );
+          }
+        }
+
+        // There is an edge case where two separate RPC endpoints are keyed by the same
+        // value. In this case, the contact book entries are duplicated so that they remain
+        // on both networks, since we don't know which network each contact is intended for.
+
+        let duplicate = false;
+        const builtInProviderNetworkIds = Object.values(
+          NETWORK_TYPE_TO_ID_MAP,
+        ).map((ids) => ids.networkId);
+        const otherRpcEntries = rpcList.filter(
+          (entry) => entry.rpcUrl !== newRpcDetails.rpcUrl,
+        );
+        if (
+          builtInProviderNetworkIds.includes(addressBookKey) ||
+          otherRpcEntries.some((entry) => entry.chainId === addressBookKey)
+        ) {
+          duplicate = true;
+        }
+
+        this.migrateAddressBookState(
+          addressBookKey,
+          updatedRpc.chainId,
+          duplicate,
+        );
+      }
+      rpcList[index] = updatedRpc;
+      this.store.updateState({ frequentRpcListDetail: rpcList });
     } else {
-      const { rpcUrl, chainId, ticker, nickname, rpcPrefs = {} } = newRpcDetails
-      return this.addToFrequentRpcList(rpcUrl, chainId, ticker, nickname, rpcPrefs)
+      const {
+        rpcUrl,
+        chainId,
+        ticker,
+        nickname,
+        rpcPrefs = {},
+      } = newRpcDetails;
+      this.addToFrequentRpcList(rpcUrl, chainId, ticker, nickname, rpcPrefs);
     }
-    return Promise.resolve(rpcList)
   }
+
   /**
    * Adds custom RPC url to state.
    *
-   * @param {string} url - The RPC url to add to frequentRpcList.
-   * @param {number} chainId - Optional chainId of the selected network.
-   * @param {string} ticker   - Optional ticker symbol of the selected network.
-   * @param {string} nickname - Optional nickname of the selected network.
-   * @returns {Promise<array>} - Promise resolving to updated frequentRpcList.
+   * @param {string} rpcUrl - The RPC url to add to frequentRpcList.
+   * @param {string} chainId - The chainId of the selected network.
+   * @param {string} [ticker] - Ticker symbol of the selected network.
+   * @param {string} [nickname] - Nickname of the selected network.
+   * @param {Object} [rpcPrefs] - Optional RPC preferences, such as the block explorer URL
    *
    */
-  addToFrequentRpcList (url, chainId, ticker = 'ETH', nickname = '', rpcPrefs = {}) {
-    const rpcList = this.getFrequentRpcListDetail()
+  addToFrequentRpcList(
+    rpcUrl,
+    chainId,
+    ticker = 'ETH',
+    nickname = '',
+    rpcPrefs = {},
+  ) {
+    const rpcList = this.getFrequentRpcListDetail();
+
     const index = rpcList.findIndex((element) => {
-      return element.rpcUrl === url
-    })
+      return element.rpcUrl === rpcUrl;
+    });
     if (index !== -1) {
-      rpcList.splice(index, 1)
+      rpcList.splice(index, 1);
     }
-    if (url !== 'http://localhost:8545') {
-      let checkedChainId
-      if (!!chainId && !Number.isNaN(parseInt(chainId))) {
-        checkedChainId = chainId
-      }
-      rpcList.push({ rpcUrl: url, chainId: checkedChainId, ticker, nickname, rpcPrefs })
+
+    if (!isPrefixedFormattedHexString(chainId)) {
+      throw new Error(`Invalid chainId: "${chainId}"`);
     }
-    this.store.updateState({ frequentRpcListDetail: rpcList })
-    return Promise.resolve(rpcList)
+
+    rpcList.push({ rpcUrl, chainId, ticker, nickname, rpcPrefs });
+    this.store.updateState({ frequentRpcListDetail: rpcList });
   }
 
   /**
    * Removes custom RPC url from state.
    *
    * @param {string} url - The RPC url to remove from frequentRpcList.
-   * @returns {Promise<array>} - Promise resolving to updated frequentRpcList.
+   * @returns {Promise<array>} Promise resolving to updated frequentRpcList.
    *
    */
-  removeFromFrequentRpcList (url) {
-    const rpcList = this.getFrequentRpcListDetail()
+  removeFromFrequentRpcList(url) {
+    const rpcList = this.getFrequentRpcListDetail();
     const index = rpcList.findIndex((element) => {
-      return element.rpcUrl === url
-    })
+      return element.rpcUrl === url;
+    });
     if (index !== -1) {
-      rpcList.splice(index, 1)
+      rpcList.splice(index, 1);
     }
-    this.store.updateState({ frequentRpcListDetail: rpcList })
-    return Promise.resolve(rpcList)
+    this.store.updateState({ frequentRpcListDetail: rpcList });
+    return Promise.resolve(rpcList);
   }
 
   /**
    * Getter for the `frequentRpcListDetail` property.
    *
-   * @returns {array<array>} - An array of rpc urls.
+   * @returns {array<array>} An array of rpc urls.
    *
    */
-  getFrequentRpcListDetail () {
-    return this.store.getState().frequentRpcListDetail
+  getFrequentRpcListDetail() {
+    return this.store.getState().frequentRpcListDetail;
   }
 
   /**
@@ -575,19 +642,19 @@ class PreferencesController {
    *
    * @param {string} feature - A key that corresponds to a UI feature.
    * @param {boolean} activated - Indicates whether or not the UI feature should be displayed
-   * @returns {Promise<object>} - Promises a new object; the updated featureFlags object.
+   * @returns {Promise<object>} Promises a new object; the updated featureFlags object.
    *
    */
-  setFeatureFlag (feature, activated) {
-    const currentFeatureFlags = this.store.getState().featureFlags
+  setFeatureFlag(feature, activated) {
+    const currentFeatureFlags = this.store.getState().featureFlags;
     const updatedFeatureFlags = {
       ...currentFeatureFlags,
       [feature]: activated,
-    }
+    };
 
-    this.store.updateState({ featureFlags: updatedFeatureFlags })
+    this.store.updateState({ featureFlags: updatedFeatureFlags });
 
-    return Promise.resolve(updatedFeatureFlags)
+    return Promise.resolve(updatedFeatureFlags);
   }
 
   /**
@@ -595,136 +662,244 @@ class PreferencesController {
    * found in the settings page.
    * @param {string} preference - The preference to enable or disable.
    * @param {boolean} value - Indicates whether or not the preference should be enabled or disabled.
-   * @returns {Promise<object>} - Promises a new object; the updated preferences object.
+   * @returns {Promise<object>} Promises a new object; the updated preferences object.
    */
-  setPreference (preference, value) {
-    const currentPreferences = this.getPreferences()
+  setPreference(preference, value) {
+    const currentPreferences = this.getPreferences();
     const updatedPreferences = {
       ...currentPreferences,
       [preference]: value,
-    }
+    };
 
-    this.store.updateState({ preferences: updatedPreferences })
-    return Promise.resolve(updatedPreferences)
+    this.store.updateState({ preferences: updatedPreferences });
+    return Promise.resolve(updatedPreferences);
   }
 
   /**
    * A getter for the `preferences` property
-   * @returns {Object} - A key-boolean map of user-selected preferences.
+   * @returns {Object} A key-boolean map of user-selected preferences.
    */
-  getPreferences () {
-    return this.store.getState().preferences
+  getPreferences() {
+    return this.store.getState().preferences;
   }
 
   /**
    * Sets the completedOnboarding state to true, indicating that the user has completed the
    * onboarding process.
    */
-  completeOnboarding () {
-    this.store.updateState({ completedOnboarding: true })
-    return Promise.resolve(true)
+  completeOnboarding() {
+    this.store.updateState({ completedOnboarding: true });
+    return Promise.resolve(true);
   }
 
   /**
    * A getter for the `ipfsGateway` property
-   * @returns {string} - The current IPFS gateway domain
+   * @returns {string} The current IPFS gateway domain
    */
-  getIpfsGateway () {
-    return this.store.getState().ipfsGateway
+  getIpfsGateway() {
+    return this.store.getState().ipfsGateway;
   }
 
   /**
    * A setter for the `ipfsGateway` property
    * @param {string} domain - The new IPFS gateway domain
-   * @returns {Promise<string>} - A promise of the update IPFS gateway domain
+   * @returns {Promise<string>} A promise of the update IPFS gateway domain
    */
-  setIpfsGateway (domain) {
-    this.store.updateState({ ipfsGateway: domain })
-    return Promise.resolve(domain)
+  setIpfsGateway(domain) {
+    this.store.updateState({ ipfsGateway: domain });
+    return Promise.resolve(domain);
+  }
+
+  /**
+   * A setter for the `useLedgerLive` property
+   * @param {bool} useLedgerLive - Value for ledger live support
+   * @returns {Promise<string>} A promise of the update to useLedgerLive
+   */
+  async setLedgerLivePreference(useLedgerLive) {
+    this.store.updateState({ useLedgerLive });
+    return useLedgerLive;
+  }
+
+  /**
+   * A getter for the `useLedgerLive` property
+   * @returns {boolean} User preference of using Ledger Live
+   */
+  getLedgerLivePreference() {
+    return this.store.getState().useLedgerLive;
+  }
+
+  /**
+   * A setter for the user preference to dismiss the seed phrase backup reminder
+   * @param {bool} dismissBackupReminder- User preference for dismissing the back up reminder
+   * @returns {void}
+   */
+  async setDismissSeedBackUpReminder(dismissSeedBackUpReminder) {
+    await this.store.updateState({
+      dismissSeedBackUpReminder,
+    });
   }
 
   //
   // PRIVATE METHODS
   //
 
-  /**
-   * Subscription to network provider type.
-   *
-   *
-   */
-  _subscribeProviderType () {
-    this.network.providerStore.subscribe(() => {
-      const { tokens } = this._getTokenRelatedStates()
-      this.store.updateState({ tokens })
-    })
+  _subscribeToInfuraAvailability() {
+    this.network.on(NETWORK_EVENTS.INFURA_IS_BLOCKED, () => {
+      this._setInfuraBlocked(true);
+    });
+    this.network.on(NETWORK_EVENTS.INFURA_IS_UNBLOCKED, () => {
+      this._setInfuraBlocked(false);
+    });
   }
 
   /**
-   * Updates `accountTokens` and `tokens` of current account and network according to it.
+   *
+   * A setter for the `infuraBlocked` property
+   * @param {boolean} isBlocked - Bool indicating whether Infura is blocked
+   *
+   */
+  _setInfuraBlocked(isBlocked) {
+    const { infuraBlocked } = this.store.getState();
+
+    if (infuraBlocked === isBlocked) {
+      return;
+    }
+
+    this.store.updateState({ infuraBlocked: isBlocked });
+  }
+
+  /**
+   * Updates `accountTokens`, `tokens`, `accountHiddenTokens` and `hiddenTokens` of current account and network according to it.
    *
    * @param {array} tokens - Array of tokens to be updated.
+   * @param {array} assetImages - Array of assets objects related to assets added
+   * @param {array} hiddenTokens - Array of tokens hidden by user
    *
    */
-  _updateAccountTokens (tokens, assetImages) {
-    const { accountTokens, providerType, selectedAddress } = this._getTokenRelatedStates()
-    accountTokens[selectedAddress][providerType] = tokens
-    this.store.updateState({ accountTokens, tokens, assetImages })
+  _updateAccountTokens(tokens, assetImages, hiddenTokens) {
+    const {
+      accountTokens,
+      chainId,
+      selectedAddress,
+      accountHiddenTokens,
+    } = this._getTokenRelatedStates();
+    accountTokens[selectedAddress][chainId] = tokens;
+    accountHiddenTokens[selectedAddress][chainId] = hiddenTokens;
+    this.store.updateState({
+      accountTokens,
+      tokens,
+      assetImages,
+      accountHiddenTokens,
+      hiddenTokens,
+    });
   }
 
   /**
-   * Updates `tokens` of current account and network.
+   * Detects whether or not a token is ERC-721 compatible.
+   *
+   * @param {string} tokensAddress - the token contract address.
+   *
+   */
+  async _detectIsERC721(tokenAddress) {
+    const checksumAddress = toChecksumHexAddress(tokenAddress);
+    // if this token is already in our contract metadata map we don't need
+    // to check against the contract
+    if (contractsMap[checksumAddress]?.erc721 === true) {
+      return Promise.resolve(true);
+    }
+    const tokenContract = await this._createEthersContract(
+      tokenAddress,
+      abiERC721,
+      this.ethersProvider,
+    );
+
+    return await tokenContract
+      .supportsInterface(ERC721_INTERFACE_ID)
+      .catch((error) => {
+        console.log('error', error);
+        log.debug(error);
+        return false;
+      });
+  }
+
+  async _createEthersContract(tokenAddress, abi, ethersProvider) {
+    const tokenContract = await new ethers.Contract(
+      tokenAddress,
+      abi,
+      ethersProvider,
+    );
+    return tokenContract;
+  }
+
+  /**
+   * Updates `tokens` and `hiddenTokens` of current account and network.
    *
    * @param {string} selectedAddress - Account address to be updated with.
    *
    */
-  _updateTokens (selectedAddress) {
-    const { tokens } = this._getTokenRelatedStates(selectedAddress)
-    this.store.updateState({ tokens })
+  _updateTokens(selectedAddress) {
+    const { tokens, hiddenTokens } = this._getTokenRelatedStates(
+      selectedAddress,
+    );
+    this.store.updateState({ tokens, hiddenTokens });
   }
 
   /**
-   * A getter for `tokens` and `accountTokens` related states.
+   * A getter for `tokens`, `accountTokens`, `hiddenTokens` and `accountHiddenTokens` related states.
    *
-   * @param {string} [selectedAddress] A new hex address for an account
-   * @returns {Object.<array, object, string, string>} - States to interact with tokens in `accountTokens`
+   * @param {string} [selectedAddress] - A new hex address for an account
+   * @returns {Object.<array, object, string, string>} States to interact with tokens in `accountTokens`
    *
    */
-  _getTokenRelatedStates (selectedAddress) {
-    const accountTokens = this.store.getState().accountTokens
+  _getTokenRelatedStates(selectedAddress) {
+    const { accountTokens, accountHiddenTokens } = this.store.getState();
     if (!selectedAddress) {
-      selectedAddress = this.store.getState().selectedAddress
+      // eslint-disable-next-line no-param-reassign
+      selectedAddress = this.store.getState().selectedAddress;
     }
-    const providerType = this.network.providerStore.getState().type
+    const chainId = this.network.getCurrentChainId();
     if (!(selectedAddress in accountTokens)) {
-      accountTokens[selectedAddress] = {}
+      accountTokens[selectedAddress] = {};
     }
-    if (!(providerType in accountTokens[selectedAddress])) {
-      accountTokens[selectedAddress][providerType] = []
+    if (!(selectedAddress in accountHiddenTokens)) {
+      accountHiddenTokens[selectedAddress] = {};
     }
-    const tokens = accountTokens[selectedAddress][providerType]
-    return { tokens, accountTokens, providerType, selectedAddress }
+    if (!(chainId in accountTokens[selectedAddress])) {
+      accountTokens[selectedAddress][chainId] = [];
+    }
+    if (!(chainId in accountHiddenTokens[selectedAddress])) {
+      accountHiddenTokens[selectedAddress][chainId] = [];
+    }
+    const tokens = accountTokens[selectedAddress][chainId];
+    const hiddenTokens = accountHiddenTokens[selectedAddress][chainId];
+    return {
+      tokens,
+      accountTokens,
+      hiddenTokens,
+      accountHiddenTokens,
+      chainId,
+      selectedAddress,
+    };
   }
 
   /**
    * Handle the suggestion of an ERC20 asset through `watchAsset`
    * *
-   * @param {Promise} promise - Promise according to addition of ERC20 token
+   * @param {Object} tokenMetadata - Token metadata
    *
    */
-  async _handleWatchAssetERC20 (options) {
-    const { address, symbol, decimals, image } = options
-    const rawAddress = address
-    try {
-      this._validateERC20AssetParams({ rawAddress, symbol, decimals })
-    } catch (err) {
-      return err
-    }
-    const tokenOpts = { rawAddress, decimals, symbol, image }
-    this.addSuggestedERC20Asset(tokenOpts)
-    return this.openPopup().then(() => {
-      const tokenAddresses = this.getTokens().filter((token) => token.address === normalizeAddress(rawAddress))
-      return tokenAddresses.length > 0
-    })
+  async _handleWatchAssetERC20(tokenMetadata) {
+    this._validateERC20AssetParams(tokenMetadata);
+
+    const address = normalizeAddress(tokenMetadata.address);
+    const { symbol, decimals, image } = tokenMetadata;
+    this._addSuggestedERC20Asset(address, symbol, decimals, image);
+
+    await this.openPopup();
+    const tokenAddresses = this.getTokens().filter(
+      (token) => token.address === address,
+    );
+    return tokenAddresses.length > 0;
   }
 
   /**
@@ -735,22 +910,46 @@ class PreferencesController {
    * doesn't fulfill requirements
    *
    */
-  _validateERC20AssetParams (opts) {
-    const { rawAddress, symbol, decimals } = opts
-    if (!rawAddress || !symbol || typeof decimals === 'undefined') {
-      throw new Error(`Cannot suggest token without address, symbol, and decimals`)
+  _validateERC20AssetParams({ address, symbol, decimals }) {
+    if (!address || !symbol || typeof decimals === 'undefined') {
+      throw ethErrors.rpc.invalidParams(
+        `Must specify address, symbol, and decimals.`,
+      );
     }
-    if (!(symbol.length < 7)) {
-      throw new Error(`Invalid symbol ${symbol} more than six characters`)
+    if (typeof symbol !== 'string') {
+      throw ethErrors.rpc.invalidParams(`Invalid symbol: not a string.`);
     }
-    const numDecimals = parseInt(decimals, 10)
+    if (!(symbol.length > 0)) {
+      throw ethErrors.rpc.invalidParams(
+        `Invalid symbol "${symbol}": shorter than a character.`,
+      );
+    }
+    if (!(symbol.length < 12)) {
+      throw ethErrors.rpc.invalidParams(
+        `Invalid symbol "${symbol}": longer than 11 characters.`,
+      );
+    }
+    const numDecimals = parseInt(decimals, 10);
     if (isNaN(numDecimals) || numDecimals > 36 || numDecimals < 0) {
-      throw new Error(`Invalid decimals ${decimals} must be at least 0, and not over 36`)
+      throw ethErrors.rpc.invalidParams(
+        `Invalid decimals "${decimals}": must be 0 <= 36.`,
+      );
     }
-    if (!isValidAddress(rawAddress)) {
-      throw new Error(`Invalid address ${rawAddress}`)
+    if (!isValidHexAddress(address, { allowNonPrefixed: false })) {
+      throw ethErrors.rpc.invalidParams(`Invalid address "${address}".`);
     }
   }
-}
 
-export default PreferencesController
+  _addSuggestedERC20Asset(address, symbol, decimals, image) {
+    const newEntry = {
+      address,
+      symbol,
+      decimals,
+      image,
+      unlisted: !LISTED_CONTRACT_ADDRESSES.includes(address),
+    };
+    const suggested = this.getSuggestedTokens();
+    suggested[address] = newEntry;
+    this.store.updateState({ suggestedTokens: suggested });
+  }
+}

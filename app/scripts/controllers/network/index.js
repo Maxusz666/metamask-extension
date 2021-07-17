@@ -1,3 +1,1 @@
-import NetworkController from './network'
-
-export default NetworkController
+export { default, NETWORK_EVENTS } from './network';
